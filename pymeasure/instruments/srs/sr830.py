@@ -1,7 +1,7 @@
 #
 # This file is part of the PyMeasure package.
 #
-# Copyright (c) 2013-2024 PyMeasure Developers
+# Copyright (c) 2013-2023 PyMeasure Developers
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -26,9 +26,9 @@ import re
 import time
 import numpy as np
 from enum import IntFlag
-from pymeasure.instruments import Instrument
+from pymeasure.instruments import Instrument, discreteTruncate
 from pymeasure.instruments.validators import strict_discrete_set, \
-    truncated_discrete_set, truncated_range, discreteTruncate
+    truncated_discrete_set, truncated_range
 
 
 class LIAStatus(IntFlag):
@@ -58,6 +58,7 @@ class ERRStatus(IntFlag):
 
 
 class SR830(Instrument):
+
     SAMPLE_FREQUENCIES = [
         62.5e-3, 125e-3, 250e-3, 500e-3, 1, 2, 4, 8, 16,
         32, 64, 128, 256, 512
@@ -457,6 +458,10 @@ class SR830(Instrument):
         """ Returns True if the magnitude is out of range
         """
         return int(self.ask("LIAS?2")) == 1
+    def is_sensitivity_out_of_range(self):
+        """ Returns True if the filter is out of range
+        """
+        return int(self.ask("LIAS?0")) == 1
 
     def quick_range(self):
         """ While the magnitude is out of range, increase
@@ -481,11 +486,7 @@ class SR830(Instrument):
         else:
             return int(query)
 
-    def fill_buffer(self, count: int, has_aborted=lambda: False, delay=0.001):
-        """ Fill two numpy arrays with the content of the instrument buffer
-
-        Eventually waiting until the specified number of recording is done
-        """
+    def fill_buffer(self, count, has_aborted=lambda: False, delay=0.001):
         ch1 = np.empty(count, np.float32)
         ch2 = np.empty(count, np.float32)
         currentCount = self.buffer_count
@@ -501,17 +502,12 @@ class SR830(Instrument):
                 self.pause_buffer()
                 return ch1, ch2
         self.pause_buffer()
-        ch1[index: count + 1] = self.get_buffer(1, index, count)  # noqa: E203
-        ch2[index: count + 1] = self.get_buffer(2, index, count)  # noqa: E203
+        ch1[index : count + 1] = self.get_buffer(1, index, count)  # noqa: E203
+        ch2[index : count + 1] = self.get_buffer(2, index, count)  # noqa: E203
         return ch1, ch2
 
     def buffer_measure(self, count, stopRequest=None, delay=1e-3):
-        """ Start a fast measurement mode and transfers data from buffer to extract mean
-        and std measurements
-
-        Return the mean and std from both channels
-        """
-        self.write("FAST2;STRD")
+        self.write("FAST0;STRD")
         ch1 = np.empty(count, np.float64)
         ch2 = np.empty(count, np.float64)
         currentCount = self.buffer_count
@@ -534,11 +530,11 @@ class SR830(Instrument):
     def pause_buffer(self):
         self.write("PAUS")
 
-    def start_buffer(self, fast=True):
+    def start_buffer(self, fast=False):
         if fast:
             self.write("FAST2;STRD")
         else:
-            self.write("FAST0")
+            self.write("FAST0;STRD")
 
     def wait_for_buffer(self, count, has_aborted=lambda: False,
                         timeout=60, timestep=0.01):
@@ -553,12 +549,33 @@ class SR830(Instrument):
         self.pause_buffer()
 
     def get_buffer(self, channel=1, start=0, end=None):
-        """ Acquires the 32 bit floating point data through binary transfer
+        """ Aquires the 32 bit floating point data through binary transfer
         """
         if end is None:
             end = self.buffer_count
         return self.binary_values("TRCB?%d,%d,%d" % (
             channel, start, end - start))
+    
+    def check_scan(self,count):
+        overload_list = []
+        go_on = False
+        self.reset_buffer()
+        while go_on == False:
+            self.aquireOnTrigger()
+            while self.buffer_count < count:
+                overload_list.append(self.is_sensitivity_out_of_range())
+                self.write("*CLS")
+            self.reset_buffer()
+            if np.any(overload_list):
+                self.write("SENS%d" % (int(self.ask("SENS?")) + 1))
+                overload_list=[]
+            else:
+                go_on = True
+        return go_on
+        
+        
+    def aquireOnTrigger(self, enable=1):
+        self.write("TSTR%d" % enable)
 
     def reset_buffer(self):
         self.write("REST")
@@ -591,31 +608,3 @@ class SR830(Instrument):
 
         command = "SNAP? " + ",".join(vals_idx)
         return self.values(command)
-
-    def save_setup(self, setup_number: int):
-        """Save the current instrument configuration (all parameters) in a memory
-        referred to by an integer
-
-        :param setup_number: the integer referring to the memory (between 1 and 9 (included))
-        """
-        if 1 <= setup_number <= 9:
-            self.write(f'SSET{setup_number:d};')
-
-    def load_setup(self, setup_number: int):
-        """ Load a previously saved instrument configuration from the memory referred
-        to by an integer
-
-        :param setup_number: the integer referring to the memory (between 1 and 9 (included))
-        """
-        if 1 <= setup_number <= 9:
-            self.write(f'RSET{setup_number:d};')
-
-    def start_scan(self):
-        """ Start the data recording into the buffer
-        """
-        self.write('STRT')
-
-    def pause_scan(self):
-        """ Pause the data recording
-        """
-        self.write('PAUS')
